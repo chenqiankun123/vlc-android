@@ -4,10 +4,10 @@ package org.videolan.vlc.util
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Rect
-import android.media.ThumbnailUtils
 import android.net.Uri
-import android.provider.MediaStore
+import android.os.SystemClock
 import android.util.Log
+import android.util.LruCache
 import androidx.annotation.WorkerThread
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -19,6 +19,7 @@ import org.videolan.medialibrary.interfaces.media.VideoGroup
 import org.videolan.medialibrary.media.MediaLibraryItem
 import org.videolan.resources.AppContextProvider
 import org.videolan.tools.BitmapCache
+import org.videolan.tools.removeFileScheme
 import org.videolan.tools.sanitizePath
 import org.videolan.vlc.BuildConfig
 import org.videolan.vlc.gui.helpers.AudioUtil.readCoverBitmap
@@ -36,6 +37,9 @@ object ThumbnailsProvider {
     private var cacheDir: String? = null
     private const val MAX_IMAGES = 4
     private val lock = Any()
+    private const val VIDEO_CACHE_PREFIX = "video-thumbnail:v2:"
+    private const val RETRY_DELAY_MS = 60_000L
+    private val failedExtractions = LruCache<String, Long>(128)
 
     @WorkerThread
     fun getFolderThumbnail(folder: Folder, width: Int): Bitmap? {
@@ -51,7 +55,7 @@ object ThumbnailsProvider {
 
     @WorkerThread
     fun getMediaThumbnail(item: MediaWrapper, width: Int): Bitmap? {
-        return if (isMediaVideo(item))
+        return if (usesGeneratedThumbnail(item))
             getVideoThumbnail(item, width)
         else
             readCoverBitmap(Uri.decode(item.artworkMrl), width)
@@ -59,8 +63,18 @@ object ThumbnailsProvider {
 
     fun isMediaVideo(item: MediaWrapper) = item.type == MediaWrapper.TYPE_VIDEO && item.artworkMrl.isNullOrEmpty()
 
+    private fun usesGeneratedThumbnail(item: MediaWrapper): Boolean {
+        if (item.type != MediaWrapper.TYPE_VIDEO) return false
+        if (item.artworkMrl.isNullOrEmpty()) return true
+        if (appDir == null) appDir = AppContextProvider.appContext.getExternalFilesDir(null)
+        val directory = appDir ?: return false
+        val artwork = Uri.decode(item.artworkMrl).removeFileScheme()
+        return artwork.startsWith(directory.absolutePath + MEDIALIB_FOLDER_NAME + "/")
+    }
+
     private fun getMediaThumbnailPath(isMedia: Boolean, item: MediaLibraryItem): String? {
-        if (isMedia && isMediaVideo(item as MediaWrapper)) {
+        if (isMedia && usesGeneratedThumbnail(item as MediaWrapper)) {
+            if (!item.artworkMrl.isNullOrEmpty()) return Uri.decode(item.artworkMrl).removeFileScheme()
             if (item.id == 0L) return item.uri.toString()
             if (appDir == null) appDir = AppContextProvider.appContext.getExternalFilesDir(null)
             val hasCache = appDir != null && appDir!!.exists()
@@ -70,42 +84,54 @@ object ThumbnailsProvider {
         return item.artworkMrl
     }
 
-    fun getMediaCacheKey(isMedia: Boolean, item: MediaLibraryItem, width: String = "") = if (width.isEmpty()) getMediaThumbnailPath(isMedia, item) else "${getMediaThumbnailPath(isMedia, item)}_$width"
+    fun getMediaCacheKey(isMedia: Boolean, item: MediaLibraryItem, width: String = ""): String? {
+        val path = getMediaThumbnailPath(isMedia, item)
+        // ImageLoader must only see video thumbnails that have passed validation.
+        val key = if (isMedia && usesGeneratedThumbnail(item as MediaWrapper))
+            VIDEO_CACHE_PREFIX + (path ?: item.uri.toString()) else path
+        return if (width.isEmpty()) key else "${key}_$width"
+    }
 
     @WorkerThread
     fun getVideoThumbnail(media: MediaWrapper, width: Int): Bitmap? {
-        val filePath = media.uri.path ?: return null
+        if (!usesGeneratedThumbnail(media)) return readCoverBitmap(Uri.decode(media.artworkMrl), width)
         if (appDir == null) appDir = AppContextProvider.appContext.getExternalFilesDir(null)
-        val hasCache = appDir?.exists() == true
-        val thumbPath = getMediaThumbnailPath(true, media) ?: return null
-        val cacheBM = if (hasCache) BitmapCache.getBitmapFromMemCache(getMediaCacheKey(true, media, width.toString())) else null
-        if (cacheBM != null) return cacheBM
-        if (hasCache && File(thumbPath).exists()) return readCoverBitmap(thumbPath, width)
-        if (media.isThumbnailGenerated) return null
-        var bitmap = synchronized(lock) {
-            if (media.uri.scheme.isSchemeFile()) ThumbnailUtils.createVideoThumbnail(filePath, MediaStore.Video.Thumbnails.MINI_KIND) else null
-        }
-        bitmap?.let { bmp ->
-            bmp.config?.let { config ->
-                val emptyBitmap = Bitmap.createBitmap(bmp.width, bmp.height, config)
-                if (bmp.sameAs(emptyBitmap)) { // myBitmap is empty/blank3
-                    bitmap = null
+        val thumbPath = getMediaThumbnailPath(true, media)
+        val cacheKey = getMediaCacheKey(true, media, width.toString())
+        BitmapCache.getBitmapFromMemCache(cacheKey)?.let { return it }
+        return synchronized(lock) {
+            BitmapCache.getBitmapFromMemCache(cacheKey)?.let { return@synchronized it }
+            if (media.id > 0 && thumbPath != null && File(thumbPath).exists()) {
+                val cached = readCoverBitmap(thumbPath, width)
+                if (cached != null && VideoThumbnailExtractor.isUsable(cached)) {
+                    BitmapCache.addBitmapToMemCache(cacheKey, cached)
+                    return@synchronized cached
                 }
+                // Evict every size, including AudioUtil's unvalidated cache entries.
+                BitmapCache.removeBitmapsFromMemCache(thumbPath)
+                BitmapCache.removeBitmapsFromMemCache(VIDEO_CACHE_PREFIX + thumbPath)
             }
-        }
-        if (bitmap != null) {
-            BitmapCache.addBitmapToMemCache(getMediaCacheKey(true, media, width.toString()), bitmap)
-            if (hasCache) {
-                media.setThumbnail(thumbPath)
-                if (media.id > 0) {
-                    BitmapUtil.saveOnDisk(bitmap!!, thumbPath)
+
+            // Bound retries for all-black videos and temporarily inaccessible sources.
+            val failureKey = "${media.uri}:${media.lastModified}:${media.length}"
+            val lastFailure = failedExtractions.get(failureKey)
+            if (lastFailure != null && SystemClock.uptimeMillis() - lastFailure < RETRY_DELAY_MS)
+                return@synchronized null
+            val bitmap = VideoThumbnailExtractor.extract(AppContextProvider.appContext, media.uri, media.length)
+            if (bitmap != null) {
+                failedExtractions.remove(failureKey)
+                // Publish the artwork only after the JPEG has actually been written.
+                if (media.id > 0 && thumbPath != null && BitmapUtil.saveOnDisk(bitmap, thumbPath)) {
+                    media.setThumbnail(thumbPath)
                     media.artworkURL = thumbPath
                 }
+                BitmapCache.addBitmapToMemCache(getMediaCacheKey(true, media, width.toString()), bitmap)
+            } else {
+                failedExtractions.put(failureKey, SystemClock.uptimeMillis())
+                if (media.id != 0L && !media.isThumbnailGenerated) media.requestThumbnail(width, 0.4f)
             }
-        } else if (media.id != 0L) {
-            media.requestThumbnail(width, 0.4f)
+            bitmap
         }
-        return bitmap
     }
 
     suspend fun getPlaylistOrGenreImage(key: String, mediaList: List<MediaWrapper>, width: Int, iconAddition: Bitmap? = null): Bitmap? {

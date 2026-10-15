@@ -88,6 +88,13 @@ object BitmapCache {
     }
 
     @Synchronized
+    fun removeBitmapsFromMemCache(path: String) {
+        for (key in memCache.snapshot().keys) {
+            if (key == path || key.startsWith("${path}_")) memCache.remove(key)
+        }
+    }
+
+    @Synchronized
     fun clear() {
         memCache.evictAll()
     }
